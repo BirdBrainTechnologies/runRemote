@@ -6,18 +6,29 @@ using System.IO;
 using System.Threading;
 using System.Diagnostics;
 
-// Quick'n'Dirty Hack - based on: http://msdn.microsoft.com/en-GB/library/system.io.filesystemwatcher.changed.aspx
+/*
+ * Author: Tom Lauwers
+ * 
+ * Description: This program checks if a python or java file has been added or changed in a given folder,
+ * then compiles & runs that file. It also logs the error and standard output to a file. 
+ * 
+ * This program was created to allow students to program BirdBrain Technologies robots remotely by 
+ * adding java or python files in a shared network folder.
+ * 
+ * The program is based on the when_changed program, by Ben Blamey:
+ * https://github.com/benblamey/when_changed
+ * He based his implementation on: http://msdn.microsoft.com/en-GB/library/system.io.filesystemwatcher.changed.aspx
+ */ 
 
 namespace when_changed
 {
     class Program
     {
-        private static string[] m_command_args;
-        private static string m_command;
 
         private static State m_state;
         private static Object m_state_lock = new Object();
-
+        // Flag to decide if we are compiling java or python code
+        private static bool runPython = false;
 
         public static void Main()
         {
@@ -26,27 +37,14 @@ namespace when_changed
 
         public static void Run()
         {
-            string[] args = System.Environment.GetCommandLineArgs();
-
-            // (First arg is the program path)
-
-            if (args.Length < 3)
-            {
-                // Display the proper way to call the program.
-                Console.WriteLine("Usage: when_changed (file path) (command) (optional-parameters)");
-                return;
-            }
-
-            String thingToWatch = args[1];
+            // Watch the current directory
+            String thingToWatch = Directory.GetCurrentDirectory(); 
             FileSystemWatcher watcher = createWatcher(thingToWatch);
-
-            m_command = args[2];
-            m_command_args = args.Skip(3).ToArray();
-
+            
             // Add event handlers.
             watcher.Changed += new FileSystemEventHandler(OnChanged);
             watcher.Created += new FileSystemEventHandler(OnChanged);
-            watcher.Deleted += new FileSystemEventHandler(OnChanged);
+            //watcher.Deleted += new FileSystemEventHandler(OnChanged); we don't do anything with deletions
             watcher.Renamed += new RenamedEventHandler(OnRenamed);
 
             // Begin watching.
@@ -56,34 +54,32 @@ namespace when_changed
             Console.WriteLine("when_changed now watching: " + watcher.Path +"\\"+ watcher.Filter);
 
             Console.WriteLine("Ctrl-C to quit.");
-
+            // Original code to force running a file - commented out
             while (true)
             {
                 var key = Console.ReadKey(true);
-                if (key.Key == ConsoleKey.F)
+                /*if (key.Key == ConsoleKey.F)
                 {
                     Console.WriteLine("Forcing run...");
                     runCmd("");
-                }
+                }*/
             }
         }
 
         public static FileSystemWatcher createWatcher(String thingToWatch)
         {
-            // Two things are determined from the argument:
             String dirToWatch; // The directory to watch.
             String fileFilter; // The filter for which files in that directory to watch.
 
-            if (!thingToWatch.Contains(Path.DirectorySeparatorChar))
+            // Set the directory to where we are running, and watch for python or java files
+            dirToWatch = Directory.GetCurrentDirectory();
+            if (runPython)
             {
-
-                dirToWatch = Directory.GetCurrentDirectory();
-                fileFilter = Path.GetFileName(thingToWatch);
+                fileFilter = "*.py";
             }
             else
             {
-                dirToWatch = Path.GetDirectoryName(thingToWatch);
-                fileFilter = Path.GetFileName(thingToWatch);
+                fileFilter = "*.java";
             }
 
             // Create a new FileSystemWatcher and set its properties.
@@ -93,9 +89,10 @@ namespace when_changed
                the renaming of files or directories. */
             watcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.DirectoryName;
 
-
             watcher.Filter = fileFilter;
-            watcher.IncludeSubdirectories = fileFilter.Contains("**");
+            // Allow subdirectories for Python only
+            watcher.IncludeSubdirectories = runPython; // fileFilter.Contains("**");
+            
             return watcher;
         }
 
@@ -167,10 +164,15 @@ namespace when_changed
                             m_state = State.WaitingToExecute;
                             again = true;
                             break;
+                            // This used to throw an exception, it no longer does because we are writing to log files
+                            // however, this does mean some changes are not executed on
                         case State.WaitingToExecute:
-                            throw new InvalidProgramException("shouldn't happen");
+                            //throw new InvalidProgramException("shouldn't happen - waiting to execute");
+                            m_state = State.Watching;
+                            again = false;
+                            break;
                         case State.Watching:
-                            throw new InvalidProgramException("shouldn't happen");
+                            throw new InvalidProgramException("shouldn't happen - watching");
                         default:
                             throw new InvalidProgramException("argh! enum values?!");
                     }
@@ -180,50 +182,140 @@ namespace when_changed
 
         private static void waitThenRun(string filechanged)
         {
-            Console.WriteLine("Running the command any second now...");
+            // Get rid of the file path, needed for Java and for the log.txt file
+            string justFileName = filechanged.Substring(filechanged.LastIndexOf("\\")+1);
 
+            Console.WriteLine("Running this file: " + justFileName);
 
             // Wait for things to calm down.
             Thread.Sleep(1500);
 
-            var startinfo = new ProcessStartInfo();
-            startinfo.FileName = m_command;
-            startinfo.WindowStyle = ProcessWindowStyle.Minimized;
-
-            if (m_command_args.Length > 0)
+            if (runPython)
             {
-                String allargs = "";
-                foreach (var arg in m_command_args)
+                var p = new Process();
+                
+                p.StartInfo.FileName = "CMD.EXE"; // Run the program from the command prompt
+                p.StartInfo.Arguments = "/c python.exe " + "\"" + filechanged + "\"";
+
+                // Don't open a new shell, and redirect the output streams
+                p.StartInfo.UseShellExecute = false;
+                p.StartInfo.RedirectStandardOutput = true;
+                p.StartInfo.RedirectStandardError = true;
+
+                string errorOut = null;
+                // Asynchronously start thread to read standard error - we can't synchronously read both standard output and error
+                p.ErrorDataReceived += new DataReceivedEventHandler((sender, e) =>
+                { errorOut += e.Data; });
+
+                p.Start();
+                // Start reading the error log
+                p.BeginErrorReadLine();
+
+                Console.WriteLine("Error/Console Output: ");
+                // Synchronously read the standard output of the spawned process.
+                StreamReader reader = p.StandardOutput;
+                string standardOut = reader.ReadToEnd();
+
+                // Write the redirected output to this application's window.
+                Console.WriteLine(standardOut);
+                p.WaitForExit();
+                // Logging output to a text file
+                String path = justFileName+"_Log.txt";
+                using (StreamWriter sr = File.AppendText(path))
                 {
-                    if (arg == "%file%")
-                        allargs += filechanged + " ";
-                    else
-                        allargs += arg + " ";
+                    sr.WriteLine(DateTime.Now.ToShortTimeString());
+                    sr.WriteLine("Running file: " + filechanged);
+                    sr.WriteLine(standardOut);
+                    sr.WriteLine(errorOut);
+                    sr.WriteLine("");
+                    sr.Close();
                 }
-                // Trim the trailing space:
-                allargs.Substring(0, allargs.Length - 1);
-                Console.WriteLine(allargs);
-                startinfo.Arguments = allargs;
             }
-
-
-            // copy over working directory like asif being run from same console.
-            startinfo.WorkingDirectory = Directory.GetCurrentDirectory();
-
-
-            // Start the execution.
-            lock (m_state_lock)
+            else
             {
-                Debug.Assert(m_state == State.WaitingToExecute);
-                m_state = State.Executing;
+                // New code - simplified since we are just running Java
+                // Step 1 - compile the file
+                var p = new Process();
+                p.StartInfo.FileName = "CMD.EXE";
+                p.StartInfo.Arguments = "/c javac.exe " + "\"" + filechanged + "\"";
+                p.StartInfo.UseShellExecute = false;
+                p.StartInfo.RedirectStandardOutput = true;
+                p.StartInfo.RedirectStandardError = true;
+
+                string errorOut = null;
+                // Asynchronously start thread to read standard error
+                p.ErrorDataReceived += new DataReceivedEventHandler((sender, e) =>
+                { errorOut += e.Data; });
+
+                p.Start();
+                // Start reading the error log
+                p.BeginErrorReadLine();
+
+                Console.WriteLine("Error/Console Output: ");
+                // Synchronously read the standard output of the spawned process.
+                StreamReader reader = p.StandardOutput;
+                string standardOut = reader.ReadToEnd();
+
+                // Write the redirected output to this application's window.
+                Console.WriteLine(standardOut);
+                p.WaitForExit();
+                // Logging output to a text file
+                String path = justFileName + "_Log.txt";
+                using (StreamWriter sr = File.AppendText(path))
+                {
+                    sr.WriteLine(DateTime.Now.ToShortTimeString());
+                    sr.WriteLine("Compiling file: " + filechanged);
+                    sr.WriteLine(standardOut);
+                    sr.WriteLine(errorOut);
+                    sr.Close();
+                }
+
+                // Checking to see if the file compiled, and only running it if it did compile
+                string pathToClassFile = justFileName.Substring(0, justFileName.Length - 5) + ".class";
+
+                if (File.Exists(pathToClassFile))
+                {
+                    // Step 2 - run the file
+                    var pRun = new Process();
+                    pRun.StartInfo.FileName = "CMD.EXE";
+                    // Removed the .java extension and used a relative path to run the file
+                    pRun.StartInfo.Arguments = "/c java.exe " + justFileName.Substring(0, justFileName.Length - 5);
+                    pRun.StartInfo.UseShellExecute = false;
+                    pRun.StartInfo.RedirectStandardOutput = true;
+                    pRun.StartInfo.RedirectStandardError = true;
+                    // Reset error
+                    errorOut = null;
+                    // Asynchronously start thread to read standard error
+                    pRun.ErrorDataReceived += new DataReceivedEventHandler((sender, e) =>
+                    { errorOut += e.Data; });
+
+                    pRun.Start();
+                    // Start reading the error log
+                    pRun.BeginErrorReadLine();
+
+                    Console.WriteLine("Error/Console Output: ");
+                    // Synchronously read the standard output of the spawned process.
+                    reader = pRun.StandardOutput;
+                    standardOut = reader.ReadToEnd();
+
+                    // Write the redirected output to this application's window.
+                    Console.WriteLine(standardOut);
+                    pRun.WaitForExit();
+                    // Logging output to a text file
+                    path = justFileName + "_Log.txt";
+                    using (StreamWriter sr = File.AppendText(path))
+                    {
+                        sr.WriteLine("Running file: " + filechanged);
+                        sr.WriteLine(standardOut);
+                        sr.WriteLine(errorOut);
+                        sr.WriteLine("");
+                        sr.Close();
+                    }
+                    // Now delete the class file
+                    File.Delete(pathToClassFile);
+                }
             }
 
-            var p = Process.Start(startinfo);
-            p.WaitForExit();
-
-            Console.WriteLine("...cmd exited");
-
-            // Wait here for windows lag???
 
         }
 
